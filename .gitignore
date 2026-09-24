@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+diagnose.log
+native/host-manifest.json
+native/run-host.cmd
