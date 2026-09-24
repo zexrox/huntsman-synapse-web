@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Huntsman TKL – Synapse Web",
+  "version": "0.2.8",
+  "description": "Synapse Web sees 1532:02d0 (RZ03-0552). Only the real keyboard 1532:02a7, interface 3, is opened.",
+  "permissions": ["nativeMessaging"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [
+    {"matches": ["https://synapse.razer.com/*"], "js": ["relay.js"], "run_at": "document_start", "all_frames": true, "world": "ISOLATED"},
+    {"matches": ["https://synapse.razer.com/*"], "js": ["virtual-hid.js"], "run_at": "document_start", "all_frames": true, "world": "MAIN"}
+  ]
+}
