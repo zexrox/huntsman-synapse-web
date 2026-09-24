@@ -25,3 +25,8 @@ Install Python 3 for Windows from [python.org](https://www.python.org/downloads/
 The 0498 firmware does not implement Game Mode key lock, single-key Snap Tap, Tournament Mode, analog report, bottom deadzone, or Analog V3.
 
 To remove it, run `uninstall.cmd`, then remove the extension in Chrome.
+
+Unofficial. Not affiliated with or supported by Razer.
+
+This project is not affiliated with, endorsed by, or supported by Razer Inc. Razer, Synapse, and Huntsman are trademarks of their owner. Synapse Web can change, and this bridge can stop working.
+
