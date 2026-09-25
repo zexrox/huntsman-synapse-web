@@ -2,7 +2,7 @@
 
 Windows, Chrome, and Python. This extension lets [Synapse Web](https://synapse.razer.com/) use the Razer Huntsman V3 Pro Tenkeyless (RZ03-0498, USB `1532:02a7`, interface 3). The page sees `1532:02d0`. The helper opens only `1532:02a7`, interface 3.
 
-Version 0.2.8.
+Version 0.2.9.
 
 ## Setup
 
@@ -12,7 +12,7 @@ Version 0.2.8.
 4. Copy the extension ID and run `install.cmd`. Python must be available as `py` (`py -m pip install hidapi`).
 5. Open https://synapse.razer.com
 
-The extension card must show version 0.2.8. The corner label reads: `Synapse Web bridge: the page sees 1532:02d0 (RZ03-0552). The keyboard stays 1532:02a7`.
+The extension card must show version 0.2.9. The corner label reads: `Synapse Web bridge: the page sees 1532:02d0 (RZ03-0552). The keyboard stays 1532:02a7`.
 
 ## Extension ID
 
@@ -22,7 +22,9 @@ Load the unpacked extension, then copy the ID Chrome shows on `chrome://extensio
 
 Install Python 3 for Windows from [python.org](https://www.python.org/downloads/). On the first installer screen, enable “Add python.exe to PATH”. Then, from the unzipped folder, run `install.cmd`. Install fails if Python is missing from PATH.
 
-The 0498 firmware does not implement Game Mode key lock, single-key Snap Tap, Tournament Mode, analog report, bottom deadzone, or Analog V3.
+The 0498 firmware does not implement Game Mode key lock*, single-key Snap Tap, Tournament Mode, analog report, bottom deadzone, or Analog V3.
+
+*Fn+F10 toggles a Windows-side key lock. It starts off. The keyboard firmware does not implement it. The Game Mode switch on the Synapse page uses that same lock.
 
 To remove it, run `uninstall.cmd`, then remove the extension in Chrome.
 
