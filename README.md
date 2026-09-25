@@ -19,16 +19,15 @@ The extension card must show version 0.2.9. The corner label reads: `Synapse Web
 Load the unpacked extension, then copy the ID Chrome shows on `chrome://extensions`. Paste that ID when `install.cmd` asks. Each person uses the ID from their own Chrome. That ID is not shared.
 
 ## Python
-
 Install Python 3 for Windows from [python.org](https://www.python.org/downloads/). On the first installer screen, enable “Add python.exe to PATH”. Then, from the unzipped folder, run `install.cmd`. Install fails if Python is missing from PATH.
 
+## Firmware
 The 0498 firmware does not implement Game Mode key lock*, single-key Snap Tap, Tournament Mode, analog report, bottom deadzone, or Analog V3.
-
 *Fn+F10 toggles a Windows-side key lock. It starts off. The keyboard firmware does not implement it. The Game Mode switch on the Synapse page uses that same lock.
 
+## Remove
 To remove it, run `uninstall.cmd`, then remove the extension in Chrome.
 
+## Notice
 Unofficial. Not affiliated with or supported by Razer.
-
 This project is not affiliated with, endorsed by, or supported by Razer Inc. Razer, Synapse, and Huntsman are trademarks of their owner. Synapse Web can change, and this bridge can stop working.
-
