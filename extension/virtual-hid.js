@@ -17,6 +17,61 @@
       window.dispatchEvent(new CustomEvent('huntsman-status', {detail: message}));
     }
   }
+  let gameModePush = 0;
+  let gameModeSeq = -1;
+  function applyGameMode(enabled) {
+    if (!location.pathname.includes('/products/')) return true;
+    const store = window.reduxStore;
+    if (!store || typeof store.dispatch !== 'function' || typeof store.getState !== 'function') return false;
+    let state;
+    try {
+      state = store.getState();
+    } catch (error) {
+      return false;
+    }
+    const current = state && state.gameMode;
+    if (!current || typeof current !== 'object') return false;
+    const on = enabled === true;
+    // from:device is the hardware-notification path. It updates this switch
+    // and does not send another HID set.
+    store.dispatch({
+      type: 'GAME_MODE',
+      from: 'device',
+      payload: {
+        gameMode: on ? 1 : 0,
+        gamingMode: {
+          ...current,
+          state: on ? 1 : 0,
+          isWindowsKeyDisabled: on,
+          isAltTabDisabled: on,
+          isAltF4Disabled: on
+        }
+      }
+    });
+    return true;
+  }
+  window.addEventListener('message', event => {
+    if (event.source !== window || event.origin !== origin || event.data?.channel !== 'huntsman-game-mode') return;
+    if (!location.pathname.includes('/products/')) return;
+    const seq = Number.isInteger(event.data.seq) ? event.data.seq : 0;
+    if (seq < gameModeSeq) return;
+    gameModeSeq = seq;
+    const enabled = event.data.enabled === true;
+    const token = ++gameModePush;
+    const delays = [400, 1200, 2500];
+    let tries = 0;
+    const tick = (delayIndex) => {
+      if (token !== gameModePush) return;
+      if (!applyGameMode(enabled)) {
+        if (++tries >= 20) return;
+        setTimeout(() => tick(0), 250);
+        return;
+      }
+      if (delayIndex >= delays.length) return;
+      setTimeout(() => tick(delayIndex + 1), delays[delayIndex]);
+    };
+    tick(0);
+  });
   window.addEventListener('message', event => {
     if (event.source !== window || event.origin !== origin || event.data?.channel !== 'huntsman-response') return;
     const entry = pending.get(event.data.id);

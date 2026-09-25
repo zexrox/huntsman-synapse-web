@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Huntsman TKL – Synapse Web",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Synapse Web sees 1532:02d0 (RZ03-0552). Only the real keyboard 1532:02a7, interface 3, is opened.",
   "permissions": ["nativeMessaging"],
   "background": {"service_worker": "background.js"},

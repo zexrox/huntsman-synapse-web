@@ -1,5 +1,10 @@
 (() => {
   const origin = 'https://synapse.razer.com';
+  const port = chrome.runtime.connect({name: 'huntsman-page'});
+  port.onMessage.addListener(message => {
+    if (message?.kind !== 'huntsman-game-mode' || typeof message.enabled !== 'boolean') return;
+    window.postMessage({channel: 'huntsman-game-mode', enabled: message.enabled, seq: message.seq}, origin);
+  });
   window.addEventListener('message', event => {
     if (event.source !== window || event.origin !== origin || event.data?.channel !== 'huntsman-request') return;
     const {id, op, reportId, data, filters, text} = event.data;

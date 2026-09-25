@@ -6,6 +6,17 @@ function connect() {
   const current = chrome.runtime.connectNative('local.huntsman.readonly');
   port = current;
   current.onMessage.addListener(message => {
+    if (message && message.op === 'game-mode' && typeof message.enabled === 'boolean') {
+      const notice = {kind: 'huntsman-game-mode', enabled: message.enabled, seq: message.seq};
+      for (const page of pages) {
+        try {
+          page.postMessage(notice);
+        } catch (error) {
+          pages.delete(page);
+        }
+      }
+      return;
+    }
     const entry = pending.get(message.id);
     if (!entry) return;
     clearTimeout(entry.timer);
@@ -23,6 +34,22 @@ function connect() {
   });
   return current;
 }
+const pages = new Set();
+chrome.runtime.onConnect.addListener(port => {
+  if (port.name !== 'huntsman-page') return;
+  let origin = '';
+  try {
+    origin = port.sender?.url ? new URL(port.sender.url).origin : '';
+  } catch (error) {
+    origin = '';
+  }
+  if (port.sender?.id !== chrome.runtime.id || origin !== 'https://synapse.razer.com') {
+    port.disconnect();
+    return;
+  }
+  pages.add(port);
+  port.onDisconnect.addListener(() => pages.delete(port));
+});
 chrome.runtime.onMessage.addListener((message, sender, reply) => {
   if (sender.id !== chrome.runtime.id || !sender.url ||
       new URL(sender.url).origin !== 'https://synapse.razer.com') return false;
