@@ -1,11 +1,14 @@
 """Forward Synapse Web feature reports to the real keyboard 1532:02a7 interface 3.
 
-Does not build packets, does not rewrite replies, and does not set a poll rate.
+Get Game Mode Selection (00:da) is answered here. Set Game Mode Selection
+(00:5a) and the Gaming Mode switch (Set LED State 03:00, LED id 8) update the
+same Windows lock Fn+F10 uses. Every other command is still forwarded.
 """
 import datetime
 import json
 import os
 from pathlib import Path
+import queue
 import struct
 import sys
 import threading
@@ -86,9 +89,18 @@ def format_filters(filters):
         return 'FILTERS count=0'
     return f'FILTERS count={len(parts)} ' + ' | '.join(parts)
 
+LOG_LOCK = threading.Lock()
+STDOUT_LOCK = threading.Lock()
+# Page parser bn(): data[0] profile, data[1] bit 0 win, bit 2 alt+tab, bit 3 alt+f4.
+# Those three are the keys this lock swallows. 0x0d is all three, 0 is none.
+GAME_MODE_LOCK_BITS = 0x01 | 0x04 | 0x08
+SUCCESS_STATUS = 2
+
 def log(message):
-    with LOG.open('a', encoding='utf-8') as f:
-        f.write(f'{datetime.datetime.now().isoformat(timespec="seconds")} {message}\n')
+    line = f'{datetime.datetime.now().isoformat(timespec="seconds")} {message}\n'
+    with LOG_LOCK:
+        with LOG.open('a', encoding='utf-8') as f:
+            f.write(line)
 
 def validate_packet(values):
     if not isinstance(values, list) or len(values) != 90:
@@ -119,6 +131,40 @@ def packet_checksum(packet):
     for value in packet[2:88]:
         checksum ^= value
     return checksum
+
+def write_message(payload):
+    encoded = json.dumps(payload).encode('utf-8')
+    with STDOUT_LOCK:
+        sys.stdout.buffer.write(struct.pack('<I', len(encoded)) + encoded)
+        sys.stdout.buffer.flush()
+
+def razer_reply(query, payload):
+    """Status 02 reply in the layout sendCommand already parses."""
+    packet = bytearray(90)
+    packet[0] = SUCCESS_STATUS
+    packet[1] = query[1]
+    packet[5] = len(payload)
+    packet[6] = query[6]
+    packet[7] = query[7]
+    packet[8:8 + len(payload)] = payload
+    packet[88] = packet_checksum(packet)
+    return bytes(packet)
+
+def game_mode_selection_payload(profile, enabled, extension):
+    payload = bytearray([profile & 0xFF, GAME_MODE_LOCK_BITS if enabled else 0])
+    if extension is not None:
+        payload.append(extension & 0xFF)
+    return bytes(payload)
+
+def selection_enabled(packet):
+    """True when Set Game Mode Selection turns on win, alt+tab, or alt+f4."""
+    if packet[5] < 2:
+        return False
+    return bool(packet[9] & GAME_MODE_LOCK_BITS)
+
+def is_game_mode_led_set(packet):
+    """Set LED State 03:00 whose LED id is GameModeLED (8). Other LEDs stay forwarded."""
+    return packet[6] == 0x03 and packet[7] == 0x00 and packet[5] >= 3 and packet[9] == 0x08
 
 def translate_request(packet):
     """Return a firmware packet when a capture shows a different working command.
@@ -168,10 +214,159 @@ def translate_reply(web, firmware):
     return bytes(out)
 
 # Status byte 1 means the keyboard is still busy. Re-read the same feature
-# report until the status changes or this bound passes. Never rewrite it.
+# report until the status changes or this bound passes. A report whose
+# transaction id or command bytes belong to the previous command is still
+# sitting in the feature report while the next command is in flight; re-read
+# that too, without writing again. Never rewrite the report.
 BUSY_STATUS = 1
 BUSY_POLL_SECONDS = 0.5
 BUSY_POLL_INTERVAL = 0.02
+
+# Interface 1, endpoint 0x82. The 48-byte interrupt payload starts with report
+# id 0x04; the next byte is 0x01 while Fn is held and 0x00 otherwise.
+# hid_read may omit that report id. F10 is VK_F10 and does not change this
+# byte. Interface 0 stays closed.
+FN_REPORT_ID = 0x04
+VK_TAB = 0x09
+VK_F4 = 0x73
+VK_F10 = 0x79
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+LLKHF_ALTDOWN = 0x20
+LLKHF_UP = 0x80
+
+def fn_held_from_report(data):
+    """Return whether Fn is held, or None when this buffer is not the Fn report.
+
+    The capture payload starts with report id 0x04 and the next byte is Fn.
+    hid_read may omit that id: then the buffer starts with 0x01 or 0x00 and
+    contains no 0x04, and that first byte is Fn. A missing 0x04 is not itself
+    Fn down, and an interior 0x04 in some other report is ignored.
+    """
+    if not data:
+        return None
+    raw = bytes(data)
+    if raw[0] == FN_REPORT_ID:
+        if len(raw) < 2:
+            return None
+        return raw[1] == 0x01
+    if FN_REPORT_ID not in raw:
+        if raw[0] == 0x01:
+            return True
+        if raw[0] == 0x00:
+            return False
+        return None
+    if raw[0] not in (0x00, 0x01):
+        return None
+    marker = raw.find(FN_REPORT_ID)
+    if marker + 1 >= len(raw):
+        return None
+    bit = raw[marker + 1]
+    if bit == 0x01:
+        return True
+    if bit == 0x00:
+        return False
+    return None
+
+def hid_path(item):
+    path = item.get('path', b'')
+    if isinstance(path, str):
+        path = path.encode('ascii', 'ignore')
+    return bytes(path)
+
+def path_has_mi(path, marker):
+    """True when path contains mi_XX as its own token. mi_01 does not match mi_010."""
+    lowered = path.lower()
+    token = marker.lower().encode('ascii')
+    hexdigits = b'0123456789abcdef'
+    start = 0
+    while True:
+        index = lowered.find(token, start)
+        if index < 0:
+            return False
+        after = index + len(token)
+        if after >= len(lowered) or lowered[after] not in hexdigits:
+            return True
+        start = index + 1
+
+def mi_marker(path):
+    """mi_ token from a device path, including a collection suffix before '#'."""
+    if isinstance(path, str):
+        raw = path.encode('ascii', 'ignore')
+    else:
+        raw = bytes(path)
+    lowered = raw.lower()
+    start = lowered.find(b'mi_')
+    if start < 0:
+        return 'mi_?'
+    end = start
+    while end < len(lowered) and lowered[end] not in b'#\\/?':
+        end += 1
+    return lowered[start:end].decode('ascii', 'ignore')
+
+def describe_candidates(items):
+    if not items:
+        return 'no mi_01 path'
+    parts = []
+    for item in items:
+        parts.append(
+            f"interface_number={item.get('interface_number')} "
+            f"usage_page={item.get('usage_page')} "
+            f"usage={item.get('usage')}"
+        )
+    return '; '.join(parts)
+
+def interface1_candidates(devices):
+    """mi_01 collections only. interface_number alone is not a match.
+
+    Windows hidapi can report interface_number 1 for every collection.
+    Never open mi_00 or interface 0.
+    """
+    found = []
+    for item in devices:
+        path = hid_path(item)
+        if item.get('interface_number') == 0 or path_has_mi(path, 'mi_00'):
+            continue
+        if not path_has_mi(path, 'mi_01'):
+            continue
+        found.append(item)
+    return found
+
+def game_mode_swallow(enabled, vk, flags, held):
+    """Return whether this key is swallowed. No HID and no key logging.
+
+    While the lock is on, that is Left Win, Right Win, Alt+Tab, and Alt+F4.
+    The matching key-up is swallowed too, so a swallowed key cannot stick.
+    """
+    is_up = bool(flags & LLKHF_UP)
+    if is_up:
+        swallow = vk in held
+        held.discard(vk)
+        return swallow
+    alt_down = bool(flags & LLKHF_ALTDOWN)
+    swallow = bool(enabled) and (
+        vk in (VK_LWIN, VK_RWIN) or (alt_down and vk in (VK_TAB, VK_F4)))
+    if swallow:
+        held.add(vk)
+    else:
+        held.discard(vk)
+    return swallow
+
+def game_mode_led_packet(transaction, enabled):
+    """Set LED State 03:00, size 3. Payload 00 08 00 off, 00 08 01 on.
+
+    Byte 08 is the game-mode LED from the gaming_modus captures.
+    """
+    packet = bytearray(90)
+    packet[1] = transaction & 0xFF
+    packet[5] = 3
+    packet[6] = 0x03
+    packet[7] = 0x00
+    packet[8] = 0x00
+    packet[9] = 0x08
+    packet[10] = 0x01 if enabled else 0x00
+    packet[88] = packet_checksum(packet)
+    return bytes(packet)
 
 class Bridge:
     def __init__(self, hid):
@@ -179,23 +374,83 @@ class Bridge:
         self.device = None
         self.cache = {}
         self.lock = threading.Lock()
+        self.led_txn = 0
+        self.game_mode = None
 
-    def read_feature_report(self, query):
-        reply = bytes(self.device.get_feature_report(0, 91))
+    def game_mode_enabled(self):
+        seq, enabled = self.game_mode_snapshot()
+        return enabled
+
+    def game_mode_snapshot(self):
+        holder = self.game_mode
+        if holder is None:
+            return 0, False
+        with holder.state_lock:
+            return holder.mode_seq, bool(holder.game_mode)
+
+    def remember(self, client, raw):
+        if len(self.cache) > 64:
+            self.cache.clear()
+        self.cache[client] = list(raw)
+
+    def notify_game_mode(self, enabled, seq):
+        write_message({'op': 'game-mode', 'enabled': bool(enabled), 'seq': int(seq)})
+
+    def close_device(self):
+        device = self.device
+        self.device = None
+        if device is not None:
+            try:
+                device.close()
+            except Exception:
+                pass
+
+    def read_feature_report(self):
+        try:
+            reply = self.device.get_feature_report(0, 91)
+        except Exception:
+            self.close_device()
+            raise
+        reply = bytes(reply)
         raw = reply[1:] if len(reply) == 91 and reply[0] == 0 else reply
         if len(raw) != 90:
             raise IOError(f'Unexpected reply length: {len(reply)}')
-        if raw[1] != query[1] or raw[6:8] != query[6:8]:
-            raise IOError('Reply does not match query; close desktop Synapse')
         return raw
 
     def await_feature_reply(self, query):
         deadline = time.monotonic() + BUSY_POLL_SECONDS
+        logged_mismatch = False
         while True:
             time.sleep(BUSY_POLL_INTERVAL)
-            raw = self.read_feature_report(query)
+            raw = self.read_feature_report()
+            if raw[1] != query[1] or raw[6:8] != query[6:8]:
+                if not logged_mismatch:
+                    log(
+                        f'WAIT reply={raw[6]:02x}:{raw[7]:02x} txn={raw[1]:02x} '
+                        f'expected={query[6]:02x}:{query[7]:02x} txn={query[1]:02x}'
+                    )
+                    logged_mismatch = True
+                if time.monotonic() >= deadline:
+                    raise IOError('Reply does not match query')
+                continue
             if raw[0] != BUSY_STATUS or time.monotonic() >= deadline:
                 return raw
+
+    def set_game_mode_led(self, enabled):
+        """Write Set LED State 03:00 under the host lock. Does not touch the page cache."""
+        with self.lock:
+            self.led_txn = (self.led_txn % 255) + 1
+            packet = game_mode_led_packet(self.led_txn, enabled)
+            self.open()
+            try:
+                result = self.device.send_feature_report(bytes([0]) + packet)
+            except Exception:
+                self.close_device()
+                raise
+            if result < 1:
+                self.close_device()
+                raise IOError('HID query transfer failed')
+            self.await_feature_reply(packet)
 
     def devices(self):
         # Real keyboard only. Never enumerate or open 1532:02d0.
@@ -237,6 +492,7 @@ class Bridge:
         if op == 'open':
             with self.lock:
                 self.open()
+            self.notify_game_mode(*self.game_mode_snapshot())
             return True
         if op == 'close':
             with self.lock:
@@ -246,20 +502,44 @@ class Bridge:
             if request.get('reportId') != 0:
                 raise ValueError('Only report ID 0 supported')
             p = validate_packet(request.get('data'))
+            command = (p[6], p[7])
+            if command == (0x00, 0xda):
+                enabled = self.game_mode_enabled()
+                raw = razer_reply(p, game_mode_selection_payload(p[8], enabled, 0))
+                with self.lock:
+                    self.remember(client, raw)
+                log(f'00:da status=02 enabled={int(enabled)}')
+                return True
+            if command == (0x00, 0x5a) or is_game_mode_led_set(p):
+                if command == (0x00, 0x5a):
+                    enabled = selection_enabled(p)
+                    extension = p[10] if p[5] >= 3 else None
+                    raw = razer_reply(p, game_mode_selection_payload(p[8], enabled, extension))
+                else:
+                    enabled = p[10] != 0
+                    raw = razer_reply(p, bytes([p[8], 0x08, 0x01 if enabled else 0x00]))
+                with self.lock:
+                    self.remember(client, raw)
+                if self.game_mode is not None:
+                    self.game_mode.set_from_page(enabled)
+                return True
             firmware = translate_request(p)
             sent = firmware if firmware is not None else p
             with self.lock:
                 self.cache.pop(client, None)
                 self.open()
-                result = self.device.send_feature_report(bytes([0]) + sent)
+                try:
+                    result = self.device.send_feature_report(bytes([0]) + sent)
+                except Exception:
+                    self.close_device()
+                    raise
                 if result < 1:
+                    self.close_device()
                     raise IOError('HID query transfer failed')
                 raw = self.await_feature_reply(sent)
                 if firmware is not None:
                     raw = translate_reply(p, raw)
-                if len(self.cache) > 64:
-                    self.cache.clear()
-                self.cache[client] = list(raw)
+                self.remember(client, raw)
             status_name = {1: 'BUSY', 2: 'SUCCESS', 5: 'COMMAND_NOT_SUPPORTED'}.get(raw[0], 'OTHER')
             command = (p[6], p[7])
             known = command in READ_COMMANDS or command in EXTRA_READS
@@ -275,6 +555,293 @@ class Bridge:
                     raise RuntimeError('No matching completed query')
                 return list(self.cache[client])
         raise ValueError('Unsupported operation')
+
+class GameMode:
+    """Fn+F10 toggles a Windows-side lock. Starts off. The hook does not touch HID."""
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.fn_down = False
+        self.game_mode = False
+        self.mode_seq = 0
+        self.state_lock = threading.Lock()
+        self.f10_down = False
+        self.held = set()
+        self.queue = queue.Queue()
+        self.stop = threading.Event()
+        self.ready = threading.Event()
+        self.reader = None
+        self.worker = None
+        self.hook_thread = None
+        self._reader_device = None
+        self._tracked = []
+        self._tracked_lock = threading.Lock()
+        self._thread_id = None
+        self._hook = None
+        self._proc = None
+
+    def start(self):
+        self.worker = threading.Thread(target=self._led_loop, name='game-mode-led', daemon=True)
+        self.worker.start()
+        self.reader = threading.Thread(target=self._read_fn, name='game-mode-fn', daemon=True)
+        self.reader.start()
+        if os.name == 'nt':
+            self.hook_thread = threading.Thread(target=self._hook_loop, name='game-mode-hook', daemon=True)
+            self.hook_thread.start()
+
+    def _track(self, device):
+        with self._tracked_lock:
+            self._tracked.append(device)
+
+    def _drop_tracked(self, device):
+        with self._tracked_lock:
+            try:
+                self._tracked.remove(device)
+            except ValueError:
+                pass
+        try:
+            device.close()
+        except Exception:
+            pass
+
+    def close(self):
+        self.stop.set()
+        with self._tracked_lock:
+            devices = list(self._tracked)
+        for device in devices:
+            try:
+                device.close()
+            except Exception:
+                pass
+        if self.hook_thread is not None:
+            self.ready.wait(timeout=2)
+            if self._thread_id and os.name == 'nt':
+                import ctypes
+                from ctypes import wintypes
+                user32 = ctypes.WinDLL('user32', use_last_error=True)
+                user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+                user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)
+            self.hook_thread.join(timeout=2)
+        if self.reader is not None:
+            self.reader.join(timeout=2)
+        self.queue.put(None)
+        if self.worker is not None:
+            self.worker.join(timeout=2)
+
+    def on_key(self, vk, flags):
+        """Return True to swallow. Queue a toggle only; do not touch HID."""
+        is_up = bool(flags & LLKHF_UP)
+        if vk == VK_F10:
+            if is_up:
+                self.f10_down = False
+            elif not self.f10_down:
+                self.f10_down = True
+                if self.fn_down:
+                    with self.state_lock:
+                        self.game_mode = not self.game_mode
+                        self.mode_seq += 1
+                        self.queue.put(('fn', self.game_mode, self.mode_seq))
+            return False
+        with self.state_lock:
+            enabled = self.game_mode
+        return game_mode_swallow(enabled, vk, flags, self.held)
+
+    def set_from_page(self, enabled):
+        """Apply a Synapse set to the same lock Fn+F10 toggles."""
+        enabled = bool(enabled)
+        with self.state_lock:
+            self.game_mode = enabled
+            self.mode_seq += 1
+            self.queue.put(('set', enabled, self.mode_seq))
+
+    def _led_loop(self):
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            source, enabled, seq = item
+            if source == 'fn':
+                log('FN+F10')
+                log('GAME MODE on' if enabled else 'GAME MODE off')
+            log('SWITCH game mode on' if enabled else 'SWITCH game mode off')
+            try:
+                self.bridge.set_game_mode_led(enabled)
+            except Exception as error:
+                log(f'ERROR {type(error).__name__}: {error}')
+            self.bridge.notify_game_mode(enabled, seq)
+
+    def _read_fn(self):
+        device = None
+        try:
+            selected = self._acquire_fn_reader()
+        except Exception as error:
+            if not self.stop.is_set():
+                log(f'ERROR {type(error).__name__}: interface 1 not opened: {error}')
+            return
+        if selected is None:
+            return
+        device, marker = selected
+        self._reader_device = device
+        log(f'FN watch ready {marker}')
+        try:
+            while not self.stop.is_set():
+                try:
+                    data = device.read(64, 200)
+                except Exception:
+                    if self.stop.is_set():
+                        break
+                    raise
+                if not data:
+                    continue
+                held = fn_held_from_report(data)
+                if held is not None:
+                    self.fn_down = held
+        except Exception as error:
+            if not self.stop.is_set():
+                log(f'ERROR {type(error).__name__}: {error}')
+        finally:
+            self._reader_device = None
+            if device is not None:
+                self._drop_tracked(device)
+
+    def _acquire_fn_reader(self):
+        """Open every mi_01 collection and keep the one that delivers Fn.
+
+        One collection is enough. Several stay open only until a buffer is
+        report 0x04 or starts with the Fn bit; the others are closed.
+        """
+        enumerated = self.bridge.hid.enumerate(0x1532, 0x02a7)
+        candidates = interface1_candidates(enumerated)
+        if not candidates:
+            raise RuntimeError(describe_candidates(candidates))
+        opened = []
+        for item in candidates:
+            if self.stop.is_set():
+                return None
+            device = self.bridge.hid.device()
+            try:
+                device.open_path(item['path'])
+            except Exception:
+                try:
+                    device.close()
+                except Exception:
+                    pass
+                continue
+            self._track(device)
+            opened.append((device, item))
+        if not opened:
+            raise RuntimeError(describe_candidates(candidates))
+        while not self.stop.is_set():
+            if len(opened) == 1:
+                device, item = opened[0]
+                return device, mi_marker(item['path'])
+            still = []
+            for device, item in opened:
+                if self.stop.is_set():
+                    return None
+                try:
+                    data = device.read(64, 200)
+                except Exception:
+                    if self.stop.is_set():
+                        return None
+                    self._drop_tracked(device)
+                    continue
+                if not data:
+                    still.append((device, item))
+                    continue
+                if fn_held_from_report(data) is not None:
+                    self.fn_down = fn_held_from_report(data)
+                    for other, _item in opened:
+                        if other is not device:
+                            self._drop_tracked(other)
+                    return device, mi_marker(item['path'])
+                self._drop_tracked(device)
+            opened = still
+            if not opened:
+                raise RuntimeError(describe_candidates(candidates))
+        return None
+
+    def _hook_loop(self):
+        user32 = None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            LRESULT = ctypes.c_ssize_t
+
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ('vkCode', ctypes.c_uint32),
+                    ('scanCode', ctypes.c_uint32),
+                    ('flags', ctypes.c_uint32),
+                    ('time', ctypes.c_uint32),
+                    ('dwExtraInfo', ctypes.c_size_t),
+                ]
+
+            HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+            user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+            user32.CallNextHookEx.restype = LRESULT
+            user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+            user32.SetWindowsHookExW.restype = wintypes.HHOOK
+            user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+            user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+            user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+            user32.GetMessageW.restype = ctypes.c_int
+            user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+            user32.PeekMessageW.restype = wintypes.BOOL
+            user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+            def callback(nCode, wParam, lParam):
+                try:
+                    if nCode == 0:
+                        info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                        if self.on_key(info.vkCode, info.flags):
+                            return 1
+                except Exception:
+                    pass
+                return user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
+
+            self._proc = HOOKPROC(callback)
+            msg = wintypes.MSG()
+            # Own this thread's message queue before the hook exists. The
+            # native-messaging thread stays blocked in ReadFile and must not
+            # be the thread that installs WH_KEYBOARD_LL.
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+            self._thread_id = kernel32.GetCurrentThreadId()
+            kernel32.Sleep.argtypes = [wintypes.DWORD]
+            self._hook = user32.SetWindowsHookExW(13, self._proc, None, 0)
+            if not self._hook:
+                log(f'ERROR OSError: keyboard hook not installed ({ctypes.get_last_error()})')
+                return
+            self.ready.set()
+            while not self.stop.is_set():
+                rc = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if rc == 0 or msg.message == 0x0012:
+                    break
+                if rc < 0:
+                    # A failed GetMessage must not unhook. Peek keeps F10
+                    # arriving on this thread.
+                    if not user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                        kernel32.Sleep(10)
+                        continue
+                    if msg.message == 0x0012:
+                        break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as error:
+            log(f'ERROR {type(error).__name__}: keyboard hook not installed: {error}')
+        finally:
+            self.ready.set()
+            hook = self._hook
+            self._hook = None
+            if hook and user32 is not None:
+                try:
+                    user32.UnhookWindowsHookEx(hook)
+                except Exception:
+                    pass
 
 def read_exact(stream, size):
     data = b''
@@ -294,7 +861,13 @@ def main():
         msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
     import hid
     bridge = Bridge(hid)
-    log('START synapse-web bridge 0.2.8')
+    log('START synapse-web bridge 0.2.9')
+    game_mode = GameMode(bridge)
+    bridge.game_mode = game_mode
+    try:
+        game_mode.start()
+    except Exception as error:
+        log(f'ERROR {type(error).__name__}: keyboard hook not installed: {error}')
     try:
         while True:
             header = read_exact(sys.stdin.buffer, 4)
@@ -309,10 +882,9 @@ def main():
             except Exception as error:
                 log(f'ERROR {type(error).__name__}: {error}')
                 response = {'id': request.get('id'), 'ok': False, 'error': str(error)}
-            encoded = json.dumps(response).encode('utf-8')
-            sys.stdout.buffer.write(struct.pack('<I', len(encoded)) + encoded)
-            sys.stdout.buffer.flush()
+            write_message(response)
     finally:
+        game_mode.close()
         if bridge.device:
             bridge.device.close()
 
